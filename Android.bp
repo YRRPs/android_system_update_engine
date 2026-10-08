@@ -286,6 +286,7 @@ cc_defaults {
         "payload_consumer/xor_extent_writer.cc",
         "payload_consumer/block_extent_writer.cc",
         "payload_consumer/snapshot_extent_writer.cc",
+        "payload_consumer/backuptool_gate.cc",
         "payload_consumer/postinstall_runner_action.cc",
         "payload_consumer/verified_source_fd.cc",
         "payload_consumer/verity_writer_android.cc",
@@ -1273,6 +1274,7 @@ cc_test {
         "aosp/update_attempter_android_unittest.cc",
         "common/utils_unittest.cc",
         "download_action_android_unittest.cc",
+        "payload_consumer/backuptool_gate_unittest.cc",
         "payload_consumer/block_extent_writer_unittest.cc",
         "payload_consumer/bzip_extent_writer_unittest.cc",
         "payload_consumer/cached_file_descriptor_unittest.cc",
@@ -1328,6 +1330,7 @@ cc_test {
     test_suites: ["device-tests"],
     srcs: [
         "payload_consumer/postinstall_runner_action_recovery_unittest.cc",
+        "payload_consumer/backuptool_gate.cc",
         "payload_consumer/postinstall_runner_action.cc",
         "common/subprocess.cc",
         "common/test_utils.cc",

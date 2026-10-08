@@ -235,7 +235,8 @@ bool PostinstallRunnerAction::RunBackuptoolScripts(
     return false;
   }
 
-  // Run backuptool script. Like system(), but its output reaches the log.
+  // Run backuptool script. Waits for the shell like system() did, and also
+  // logs its stdout and stderr.
   const string& name = partition.name;
   int ret = RunCapturingOutput(
       "/postinstall/system/bin/backuptool_postinstall.sh",

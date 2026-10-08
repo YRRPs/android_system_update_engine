@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <fstream>
@@ -66,7 +67,10 @@ std::string WriteTempImage(const std::vector<uint8_t>& image) {
   char path[] = "./backuptool_gate_test_XXXXXX";
 #endif
   int fd = mkstemp(path);
-  EXPECT_GE(fd, 0);
+  if (fd < 0) {
+    ADD_FAILURE() << "mkstemp failed";
+    return path;
+  }
   EXPECT_EQ(write(fd, image.data(), image.size()),
             static_cast<ssize_t>(image.size()));
   close(fd);
@@ -212,14 +216,15 @@ TEST(BackuptoolGateTest, DecisionLineStatesDecisionAndReason) {
 
 TEST(BackuptoolGateTest, ReadsSuperblockBufferedAndDirect) {
   std::string path = WriteTempImage(MakeImage(0xEF53, 1, 5, 6));
-  for (ReadMode mode : {ReadMode::kBuffered, ReadMode::kDirect}) {
-    Ext4SuperblockInfo info = ReadExt4Superblock(path, mode);
+  Ext4SuperblockInfo buffered = ReadExt4Superblock(path, ReadMode::kBuffered);
+  Ext4SuperblockInfo direct = ReadExt4Superblock(path, ReadMode::kDirect);
+  unlink(path.c_str());
+  for (const Ext4SuperblockInfo& info : {buffered, direct}) {
     EXPECT_TRUE(info.read_ok);
     EXPECT_TRUE(info.is_ext4);
     EXPECT_EQ(info.mount_count, 1);
     EXPECT_EQ(info.write_time, 6u);
   }
-  unlink(path.c_str());
 }
 
 TEST(BackuptoolGateTest, MissingDeviceIsReadFailure) {
@@ -244,6 +249,21 @@ TEST(BackuptoolGateTest, CapturesStdoutStderrAndStatus) {
   EXPECT_EQ(WEXITSTATUS(status), 3);
   EXPECT_EQ(lines,
             (std::vector<std::string>{"out", "err", "no newline"}));
+}
+
+// system() returns when the shell exits. A helper an addon.d script leaves
+// running in the background must not hold postinstall open.
+TEST(BackuptoolGateTest, BackgroundChildDoesNotBlockReturn) {
+  std::vector<std::string> lines;
+  auto start = std::chrono::steady_clock::now();
+  int status = RunCapturingOutput(
+      "(sleep 5; echo late) & echo done",
+      [&lines](const std::string& line) { lines.push_back(line); });
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  EXPECT_LT(elapsed, std::chrono::seconds(3));
+  EXPECT_EQ(lines, (std::vector<std::string>{"done"}));
 }
 
 TEST(BackuptoolGateTest, MissingCommandReportsShellStatus) {

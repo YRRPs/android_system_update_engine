@@ -99,9 +99,12 @@ std::string FormatReadLine(const std::string& partition,
 std::string FormatDecisionLine(const std::string& partition,
                                const BackuptoolDecision& decision);
 
-// Runs |command| through the shell like system(), passing each line of its
-// combined stdout and stderr to |on_line|. Returns the wait status, or -1 if
-// the shell could not be started.
+// Runs |command| through the shell and waits for the shell to exit, like
+// system(). Then passes each line of the combined stdout and stderr written so
+// far to |on_line|. Output from background processes the command leaves
+// running is not waited for. Returns the wait status, or -1 if the shell could
+// not be started. Unlike system(), it does not ignore SIGINT and SIGQUIT in the
+// caller.
 int RunCapturingOutput(const std::string& command,
                        const std::function<void(const std::string&)>& on_line);
 

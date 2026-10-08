@@ -16,10 +16,15 @@
 
 #include "update_engine/payload_consumer/backuptool_gate.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <paths.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -72,6 +77,56 @@ bool ReadPrefix(int fd, uint8_t* buffer, size_t size) {
     done += static_cast<size_t>(n);
   }
   return true;
+}
+
+// Starts "sh -c |command|" with stdout and stderr on |out_fd|. The child
+// inherits this thread's setexeccon() context, as with system().
+pid_t SpawnShell(const std::string& command, int out_fd) {
+  posix_spawn_file_actions_t actions;
+  if (posix_spawn_file_actions_init(&actions) != 0) {
+    return -1;
+  }
+  posix_spawn_file_actions_adddup2(&actions, out_fd, STDOUT_FILENO);
+  posix_spawn_file_actions_adddup2(&actions, out_fd, STDERR_FILENO);
+  const char* argv[] = {"sh", "-c", command.c_str(), nullptr};
+  pid_t pid = -1;
+  int rc = posix_spawn(&pid, _PATH_BSHELL, &actions, nullptr,
+                       const_cast<char* const*>(argv), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  return rc == 0 ? pid : -1;
+}
+
+int WaitForExit(pid_t pid) {
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) {
+      return -1;
+    }
+  }
+  return status;
+}
+
+// Passes each line written to |fd| so far to |on_line|.
+void EmitLines(int fd,
+               const std::function<void(const std::string&)>& on_line) {
+  std::string line;
+  char buffer[4096];
+  off_t offset = 0;
+  ssize_t n;
+  while ((n = pread(fd, buffer, sizeof(buffer), offset)) > 0) {
+    offset += n;
+    for (ssize_t i = 0; i < n; i++) {
+      if (buffer[i] == '\n') {
+        on_line(line);
+        line.clear();
+      } else {
+        line.push_back(buffer[i]);
+      }
+    }
+  }
+  if (!line.empty()) {
+    on_line(line);
+  }
 }
 
 }  // namespace
@@ -204,26 +259,17 @@ std::string FormatDecisionLine(const std::string& partition,
 int RunCapturingOutput(
     const std::string& command,
     const std::function<void(const std::string&)>& on_line) {
-  // Redirect stderr for the whole shell, not only the last command.
-  // "e" sets O_CLOEXEC on update_engine's end of the pipe.
-  FILE* pipe = popen(("exec 2>&1; " + command).c_str(), "re");
-  if (pipe == nullptr) {
+  // Output goes to an anonymous file rather than a pipe, so a background
+  // process that inherits stdout cannot keep this call waiting for EOF.
+  int out_fd = memfd_create("backuptool_output", MFD_CLOEXEC);
+  if (out_fd < 0) {
     return -1;
   }
-  std::string line;
-  int c;
-  while ((c = fgetc(pipe)) != EOF) {
-    if (c == '\n') {
-      on_line(line);
-      line.clear();
-    } else {
-      line.push_back(static_cast<char>(c));
-    }
-  }
-  if (!line.empty()) {
-    on_line(line);
-  }
-  return pclose(pipe);
+  pid_t pid = SpawnShell(command, out_fd);
+  int status = pid < 0 ? -1 : WaitForExit(pid);
+  EmitLines(out_fd, on_line);
+  close(out_fd);
+  return status;
 }
 
 }  // namespace chromeos_update_engine

@@ -286,7 +286,6 @@ cc_defaults {
         "payload_consumer/xor_extent_writer.cc",
         "payload_consumer/block_extent_writer.cc",
         "payload_consumer/snapshot_extent_writer.cc",
-        "payload_consumer/backuptool_gate.cc",
         "payload_consumer/postinstall_runner_action.cc",
         "payload_consumer/verified_source_fd.cc",
         "payload_consumer/verity_writer_android.cc",
@@ -295,6 +294,14 @@ cc_defaults {
         "payload_consumer/partition_update_generator_android.cc",
         "update_status_utils.cc",
     ],
+
+    target: {
+        android: {
+            // Only the device gate (RUN_BACKUPTOOL) calls it, and it uses
+            // memfd_create(), which the glibc 2.17 host sysroot lacks.
+            srcs: ["payload_consumer/backuptool_gate.cc"],
+        },
+    },
 }
 
 cc_library_static {

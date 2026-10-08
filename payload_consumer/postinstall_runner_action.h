@@ -28,6 +28,7 @@
 
 #include "update_engine/common/boot_control_interface.h"
 #include "update_engine/common/hardware_interface.h"
+#include "update_engine/payload_consumer/backuptool_gate.h"
 #include "update_engine/payload_consumer/install_plan.h"
 
 // The Postinstall Runner Action is responsible for running the postinstall
@@ -75,6 +76,18 @@ class PostinstallRunnerAction : public InstallPlanAction {
   void PerformPartitionPostinstall();
   [[nodiscard]] bool MountPartition(
       const InstallPlan::Partition& partition) noexcept;
+
+#if defined(__ANDROID__) && !defined(__ANDROID_RECOVERY__) && \
+    defined(RUN_BACKUPTOOL)
+  // LineageOS backuptool gate; see backuptool_gate.h.
+  [[nodiscard]] bool RunBackuptoolGate(const InstallPlan::Partition& partition,
+                                       const std::string& mountable_device);
+  void LogBackuptoolGateComparisonReads(const BackuptoolGateInputs& gate,
+                                        bool have_source);
+  [[nodiscard]] bool RunBackuptoolScripts(
+      const InstallPlan::Partition& partition,
+      const std::string& mountable_device);
+#endif
 
   // Called whenever the |progress_fd_| has data available to read.
   void OnProgressFdReady();

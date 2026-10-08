@@ -294,6 +294,14 @@ cc_defaults {
         "payload_consumer/partition_update_generator_android.cc",
         "update_status_utils.cc",
     ],
+
+    target: {
+        android: {
+            // Only the device gate (RUN_BACKUPTOOL) calls it, and it uses
+            // memfd_create(), which the glibc 2.17 host sysroot lacks.
+            srcs: ["payload_consumer/backuptool_gate.cc"],
+        },
+    },
 }
 
 cc_library_static {
@@ -1273,6 +1281,7 @@ cc_test {
         "aosp/update_attempter_android_unittest.cc",
         "common/utils_unittest.cc",
         "download_action_android_unittest.cc",
+        "payload_consumer/backuptool_gate_unittest.cc",
         "payload_consumer/block_extent_writer_unittest.cc",
         "payload_consumer/bzip_extent_writer_unittest.cc",
         "payload_consumer/cached_file_descriptor_unittest.cc",
@@ -1328,6 +1337,7 @@ cc_test {
     test_suites: ["device-tests"],
     srcs: [
         "payload_consumer/postinstall_runner_action_recovery_unittest.cc",
+        "payload_consumer/backuptool_gate.cc",
         "payload_consumer/postinstall_runner_action.cc",
         "common/subprocess.cc",
         "common/test_utils.cc",

@@ -39,6 +39,7 @@
 #include "update_engine/common/platform_constants.h"
 #include "update_engine/common/subprocess.h"
 #include "update_engine/common/utils.h"
+#include "update_engine/payload_consumer/backuptool_gate.h"
 
 namespace {
 
@@ -161,6 +162,101 @@ void PostinstallRunnerAction::PerformAction() {
   PerformPartitionPostinstall();
 }
 
+#if defined(__ANDROID__) && !defined(__ANDROID_RECOVERY__) && \
+    defined(RUN_BACKUPTOOL)
+// Logs every input of the LineageOS backuptool gate, then applies it
+// unchanged. The decision still comes from a buffered read of the device that
+// GetPartitionDevice() returns for the source slot. The extra reads (O_DIRECT
+// on that device, buffered and O_DIRECT on /dev/block/mapper/<name><suffix>)
+// only feed the log.
+bool PostinstallRunnerAction::RunBackuptoolGate(
+    const InstallPlan::Partition& partition, const string& mountable_device) {
+  BackuptoolGateInputs gate;
+  gate.partition = partition.name;
+  gate.source_slot = install_plan_.source_slot;
+  gate.target_slot = install_plan_.target_slot;
+  if (install_plan_.source_slot != BootControlInterface::kInvalidSlot) {
+    boot_control_->GetPartitionDevice(
+        partition.name, install_plan_.source_slot, &gate.source_path);
+  }
+  const bool have_source = !gate.source_path.empty();
+  gate.source_real = ResolvePath(gate.source_path);
+  gate.mapper_path = MapperPathFor(partition.name, install_plan_.source_slot);
+  gate.mapper_real = ResolvePath(gate.mapper_path);
+  if (have_source) {
+    gate.source = ReadExt4Superblock(gate.source_path, ReadMode::kBuffered);
+  }
+  LOG(INFO) << FormatGateLine(gate);
+  // Legacy line, kept so new logs compare directly with older ones.
+  LOG(INFO) << gate.source_path << " has been mounted R/W "
+            << gate.source.mount_count << " times.";
+  LogBackuptoolGateComparisonReads(gate, have_source);
+
+  const BackuptoolDecision decision = DecideBackuptool(have_source, gate.source);
+  LOG(INFO) << FormatDecisionLine(partition.name, decision);
+  if (!decision.run) {
+    LOG(INFO) << "Skipping backuptool scripts";
+    return true;
+  }
+  return RunBackuptoolScripts(partition, mountable_device);
+}
+
+void PostinstallRunnerAction::LogBackuptoolGateComparisonReads(
+    const BackuptoolGateInputs& gate, bool have_source) {
+  if (have_source) {
+    LOG(INFO) << FormatReadLine(
+        gate.partition, "source", ReadMode::kDirect, gate.source_path,
+        ReadExt4Superblock(gate.source_path, ReadMode::kDirect));
+  }
+  if (gate.mapper_path.empty()) {
+    return;
+  }
+  for (ReadMode mode : {ReadMode::kBuffered, ReadMode::kDirect}) {
+    LOG(INFO) << FormatReadLine(gate.partition, "mapper", mode,
+                                gate.mapper_path,
+                                ReadExt4Superblock(gate.mapper_path, mode));
+  }
+}
+
+bool PostinstallRunnerAction::RunBackuptoolScripts(
+    const InstallPlan::Partition& partition, const string& mountable_device) {
+  if (!utils::SetBlockDeviceReadOnly(mountable_device, false)) {
+    LOG(ERROR) << "Error marking the device " << mountable_device << " writeable.";
+    return false;
+  }
+  // Mount the target partition R/W
+  LOG(INFO) << "Running backuptool scripts";
+  utils::MountFilesystem(mountable_device, fs_mount_dir_, MS_NOATIME | MS_NODEV | MS_NODIRATIME,
+                         partition.filesystem_type, "seclabel");
+
+  // Switch to a permissive domain
+  if (setexeccon("u:r:backuptool:s0")) {
+    LOG(ERROR) << "Failed to set backuptool context";
+    return false;
+  }
+
+  // Run backuptool script. Waits for the shell like system() did, and also
+  // logs its stdout and stderr.
+  const string& name = partition.name;
+  int ret = RunCapturingOutput(
+      "/postinstall/system/bin/backuptool_postinstall.sh",
+      [&name](const string& line) {
+        LOG(INFO) << "backuptool[" << name << "]: " << line;
+      });
+  LOG(INFO) << "BackuptoolGate: partition=" << name << " backuptool_ret=" << ret;
+  if (ret == -1 || WEXITSTATUS(ret) != 0) {
+    LOG(ERROR) << "Backuptool postinstall step failed. ret=" << ret;
+  }
+
+  // Switch back to update_engine domain
+  if (setexeccon(nullptr)) {
+    LOG(ERROR) << "Failed to set update_engine context";
+    return false;
+  }
+  return true;
+}
+#endif  // __ANDROID__ && !__ANDROID_RECOVERY__ && RUN_BACKUPTOOL
+
 bool PostinstallRunnerAction::MountPartition(
     const InstallPlan::Partition& partition) noexcept {
   // Perform post-install for the current_partition_ partition. At this point we
@@ -201,52 +297,8 @@ bool PostinstallRunnerAction::MountPartition(
   //   0x34: len16 Number of mounts since the last fsck
   //   0x38: len16 Magic signature 0xEF53
 
-  string source_path;
-
-  if (install_plan_.source_slot != BootControlInterface::kInvalidSlot) {
-    boot_control_->GetPartitionDevice(partition.name, install_plan_.source_slot, &source_path);
-  }
-
-  uint16_t mount_count = 0;
-
-  if (!source_path.empty()) {
-    brillo::Blob chunk;
-
-    utils::ReadFileChunk(source_path, 0x400 + 0x34, sizeof(uint16_t), &chunk);
-    mount_count = *reinterpret_cast<uint16_t*>(chunk.data());
-  }
-
-  LOG(INFO) << source_path << " has been mounted R/W " << mount_count << " times.";
-
-  if (mount_count > 0) {
-    if (!utils::SetBlockDeviceReadOnly(mountable_device, false)) {
-      LOG(ERROR) << "Error marking the device " << mountable_device << " writeable.";
-      return false;
-    }
-    // Mount the target partition R/W
-    LOG(INFO) << "Running backuptool scripts";
-    utils::MountFilesystem(mountable_device, fs_mount_dir_, MS_NOATIME | MS_NODEV | MS_NODIRATIME,
-                           partition.filesystem_type, "seclabel");
-
-    // Switch to a permissive domain
-    if (setexeccon("u:r:backuptool:s0")) {
-      LOG(ERROR) << "Failed to set backuptool context";
-      return false;
-    }
-
-    // Run backuptool script
-    int ret = system("/postinstall/system/bin/backuptool_postinstall.sh");
-    if (ret == -1 || WEXITSTATUS(ret) != 0) {
-      LOG(ERROR) << "Backuptool postinstall step failed. ret=" << ret;
-    }
-
-    // Switch back to update_engine domain
-    if (setexeccon(nullptr)) {
-      LOG(ERROR) << "Failed to set update_engine context";
-      return false;
-    }
-  } else {
-    LOG(INFO) << "Skipping backuptool scripts";
+  if (!RunBackuptoolGate(partition, mountable_device)) {
+    return false;
   }
 
   utils::UnmountFilesystem(fs_mount_dir_);

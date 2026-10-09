@@ -17,10 +17,12 @@
 #include "update_engine/payload_consumer/backuptool_gate.h"
 
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <climits>
 #include <cstdint>
 #include <fstream>
@@ -138,19 +140,143 @@ TEST(BackuptoolGateTest, SkipsWhenExt4MountCountZero) {
   EXPECT_EQ(decision.reason, "mount count 0");
 }
 
-// LineageOS gates on the raw bytes without checking the magic. Keep that.
-TEST(BackuptoolGateTest, NonExt4KeepsLegacyRawCountDecision) {
+// The raw bytes at 0x434 are not a mount count on EROFS, and the backuptool
+// script lives only on system. Skip instead of running it to exit 127.
+TEST(BackuptoolGateTest, SkipsNonExt4Partition) {
   auto garbage = MakeImage(0x1234, 2750, 0, 0);
-  auto run = DecideBackuptool(
+  auto decision = DecideBackuptool(
       true, ParseExt4Superblock(garbage.data(), garbage.size()));
-  EXPECT_TRUE(run.run);
-  EXPECT_EQ(run.reason, "not ext4, legacy raw count 2750");
+  EXPECT_FALSE(decision.run);
+  EXPECT_EQ(decision.reason, "not ext4, legacy raw count 2750");
+}
 
-  auto zero = MakeImage(0x1234, 0, 0, 0);
-  auto skip =
-      DecideBackuptool(true, ParseExt4Superblock(zero.data(), zero.size()));
+AddonScripts Listed(std::vector<std::string> names) {
+  AddonScripts addons;
+  addons.listed = true;
+  addons.names = std::move(names);
+  return addons;
+}
+
+// An incremental OTA read an on-disk count of 0 on a system that held
+// 30-gapps.sh, skipped backuptool, and dropped GApps (YRRPs/project#12).
+TEST(BackuptoolGateTest, RunsForAddonScriptsWhenMountCountZero) {
+  auto image = MakeImage(0xEF53, 0, 0, 0);
+  auto decision =
+      DecideBackuptool(true, ParseExt4Superblock(image.data(), image.size()),
+                       Listed({"30-gapps.sh"}));
+  EXPECT_TRUE(decision.run);
+  EXPECT_EQ(decision.reason, "addon.d has 30-gapps.sh; mount count 0");
+}
+
+TEST(BackuptoolGateTest, NamesEveryAddonScriptWhenMountCountPositive) {
+  auto image = MakeImage(0xEF53, 2, 0, 0);
+  auto decision =
+      DecideBackuptool(true, ParseExt4Superblock(image.data(), image.size()),
+                       Listed({"10-a.sh", "30-gapps.sh"}));
+  EXPECT_TRUE(decision.run);
+  EXPECT_EQ(decision.reason, "addon.d has 10-a.sh,30-gapps.sh; mount count 2");
+}
+
+TEST(BackuptoolGateTest, SkipsWithoutAddonScriptsWhenMountCountZero) {
+  auto image = MakeImage(0xEF53, 0, 0, 0);
+  auto decision = DecideBackuptool(
+      true, ParseExt4Superblock(image.data(), image.size()), Listed({}));
+  EXPECT_FALSE(decision.run);
+  EXPECT_EQ(decision.reason, "mount count 0; no third-party addon.d scripts");
+}
+
+TEST(BackuptoolGateTest, FallsBackToMountCountWhenAddonDirUnreadable) {
+  AddonScripts unreadable;
+  unreadable.error = "Permission denied";
+  auto zero = MakeImage(0xEF53, 0, 0, 0);
+  auto skip = DecideBackuptool(
+      true, ParseExt4Superblock(zero.data(), zero.size()), unreadable);
   EXPECT_FALSE(skip.run);
-  EXPECT_EQ(skip.reason, "not ext4, legacy raw count 0");
+  EXPECT_EQ(skip.reason, "mount count 0; addon.d unreadable: Permission denied");
+
+  auto one = MakeImage(0xEF53, 1, 0, 0);
+  auto run = DecideBackuptool(
+      true, ParseExt4Superblock(one.data(), one.size()), unreadable);
+  EXPECT_TRUE(run.run);
+  EXPECT_EQ(run.reason, "mount count 1; addon.d unreadable: Permission denied");
+}
+
+TEST(BackuptoolGateTest, RunsForAddonScriptsWhenSuperblockUnreadable) {
+  auto decision =
+      DecideBackuptool(true, Ext4SuperblockInfo{}, Listed({"30-gapps.sh"}));
+  EXPECT_TRUE(decision.run);
+  EXPECT_EQ(decision.reason, "addon.d has 30-gapps.sh; superblock read failed");
+}
+
+// An EROFS system cannot use the mount count, but its add-ons still need
+// preserving.
+TEST(BackuptoolGateTest, RunsForAddonScriptsOnNonExt4System) {
+  auto erofs = MakeImage(0x1234, 0, 0, 0);
+  auto decision =
+      DecideBackuptool(true, ParseExt4Superblock(erofs.data(), erofs.size()),
+                       Listed({"30-gapps.sh"}));
+  EXPECT_TRUE(decision.run);
+  EXPECT_EQ(decision.reason,
+            "addon.d has 30-gapps.sh; not ext4, legacy raw count 0");
+}
+
+TEST(BackuptoolGateTest, SkipsWithoutSourceDeviceEvenWithAddonScripts) {
+  auto decision =
+      DecideBackuptool(false, Ext4SuperblockInfo{}, Listed({"30-gapps.sh"}));
+  EXPECT_FALSE(decision.run);
+  EXPECT_EQ(decision.reason, "no source device");
+}
+
+std::string MakeTempDir() {
+  // Same writable locations as WriteTempImage().
+#ifdef __ANDROID__
+  char path[] = "/data/local/tmp/backuptool_addon_test_XXXXXX";
+#else
+  char path[] = "./backuptool_addon_test_XXXXXX";
+#endif
+  if (mkdtemp(path) == nullptr) {
+    ADD_FAILURE() << "mkdtemp failed";
+    return "";
+  }
+  return path;
+}
+
+void Touch(const std::string& path) {
+  std::ofstream(path) << "#!/sbin/sh\n";
+}
+
+TEST(BackuptoolGateTest, ListsThirdPartyAddonScriptsSorted) {
+  std::string dir = MakeTempDir();
+  for (const char* name :
+       {"50-lineage.sh", "30-gapps.sh", "README", "10-a.sh", "x.sh.bak"}) {
+    Touch(dir + "/" + name);
+  }
+  AddonScripts addons = ListThirdPartyAddonScripts(dir);
+  EXPECT_TRUE(addons.listed);
+  EXPECT_EQ(addons.error, "");
+  EXPECT_EQ(addons.names,
+            (std::vector<std::string>{"10-a.sh", "30-gapps.sh"}));
+  std::system(("rm -rf " + dir).c_str());
+}
+
+// Without /system/addon.d there is nothing for backuptool to preserve.
+TEST(BackuptoolGateTest, MissingAddonDirListsNothing) {
+  AddonScripts addons = ListThirdPartyAddonScripts("./no_such_addon_dir");
+  EXPECT_TRUE(addons.listed);
+  EXPECT_TRUE(addons.names.empty());
+}
+
+TEST(BackuptoolGateTest, UnlistableAddonDirReportsError) {
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "root ignores directory permissions";
+  }
+  std::string dir = MakeTempDir();
+  chmod(dir.c_str(), 0);
+  AddonScripts addons = ListThirdPartyAddonScripts(dir);
+  chmod(dir.c_str(), 0700);
+  EXPECT_FALSE(addons.listed);
+  EXPECT_EQ(addons.error, "Permission denied");
+  rmdir(dir.c_str());
 }
 
 TEST(BackuptoolGateTest, SkipsWithoutSourceDevice) {
@@ -271,6 +397,16 @@ TEST(BackuptoolGateTest, MissingCommandReportsShellStatus) {
                                   [](const std::string&) {});
   ASSERT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 127);  // ret=32512 in the LineageOS log.
+}
+
+// A run that logs no lines must still show whether any output arrived.
+TEST(BackuptoolGateTest, ReportsCapturedByteCount) {
+  size_t bytes = 99;
+  RunCapturingOutput("printf 'ab\\ncd'", [](const std::string&) {}, &bytes);
+  EXPECT_EQ(bytes, 5u);
+
+  RunCapturingOutput("true", [](const std::string&) {}, &bytes);
+  EXPECT_EQ(bytes, 0u);
 }
 
 }  // namespace chromeos_update_engine

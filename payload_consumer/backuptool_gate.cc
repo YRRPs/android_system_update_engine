@@ -16,6 +16,7 @@
 
 #include "update_engine/payload_consumer/backuptool_gate.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,10 +24,12 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 
@@ -44,6 +47,8 @@ constexpr size_t kMagicOffset = kSuperblockOffset + 0x38;
 constexpr uint16_t kExt4Magic = 0xEF53;
 constexpr unsigned int kMaxSlots = 2;
 constexpr char kLinePrefix[] = "BackuptoolGate: partition=";
+constexpr char kLineageAddonScript[] = "50-lineage.sh";
+constexpr char kAddonScriptSuffix[] = ".sh";
 
 uint16_t LoadLe16(const uint8_t* data) {
   return static_cast<uint16_t>(data[0] | (data[1] << 8));
@@ -106,9 +111,37 @@ int WaitForExit(pid_t pid) {
   return status;
 }
 
-// Passes each line written to |fd| so far to |on_line|.
-void EmitLines(int fd,
-               const std::function<void(const std::string&)>& on_line) {
+struct DirCloser {
+  void operator()(DIR* dir) const { closedir(dir); }
+};
+
+bool IsThirdPartyAddonScript(const std::string& name) {
+  const size_t suffix_len = sizeof(kAddonScriptSuffix) - 1;
+  return name.size() > suffix_len &&
+         name.compare(name.size() - suffix_len, suffix_len,
+                      kAddonScriptSuffix) == 0 &&
+         name != kLineageAddonScript;
+}
+
+std::string JoinNames(const std::vector<std::string>& names) {
+  std::string joined;
+  for (const std::string& name : names) {
+    joined += (joined.empty() ? "" : ",") + name;
+  }
+  return joined;
+}
+
+// Explains a mount-count decision for a system whose addon.d named nothing.
+std::string AddonSuffix(const AddonScripts& addons) {
+  if (!addons.error.empty()) {
+    return "; addon.d unreadable: " + addons.error;
+  }
+  return addons.listed ? "; no third-party addon.d scripts" : "";
+}
+
+// Passes each line written to |fd| so far to |on_line|. Returns the byte count.
+size_t EmitLines(int fd,
+                 const std::function<void(const std::string&)>& on_line) {
   std::string line;
   char buffer[4096];
   off_t offset = 0;
@@ -127,6 +160,7 @@ void EmitLines(int fd,
   if (!line.empty()) {
     on_line(line);
   }
+  return static_cast<size_t>(offset);
 }
 
 }  // namespace
@@ -170,22 +204,47 @@ Ext4SuperblockInfo ReadExt4Superblock(const std::string& path, ReadMode mode) {
   return ParseExt4Superblock(buffer.get(), kBackuptoolGateReadSize);
 }
 
+AddonScripts ListThirdPartyAddonScripts(const std::string& dir) {
+  AddonScripts addons;
+  std::unique_ptr<DIR, DirCloser> handle(opendir(dir.c_str()));
+  if (!handle) {
+    if (errno == ENOENT) {
+      addons.listed = true;
+    } else {
+      addons.error = strerror(errno);
+    }
+    return addons;
+  }
+  addons.listed = true;
+  while (const dirent* entry = readdir(handle.get())) {
+    if (IsThirdPartyAddonScript(entry->d_name)) {
+      addons.names.push_back(entry->d_name);
+    }
+  }
+  std::sort(addons.names.begin(), addons.names.end());
+  return addons;
+}
+
 BackuptoolDecision DecideBackuptool(bool have_source_device,
-                                    const Ext4SuperblockInfo& source) {
+                                    const Ext4SuperblockInfo& source,
+                                    const AddonScripts& addons) {
   if (!have_source_device) {
     return {false, "no source device"};
   }
-  if (!source.read_ok) {
-    return {false, "superblock read failed"};
+  const std::string raw = std::to_string(source.mount_count);
+  const std::string count = !source.read_ok ? "superblock read failed"
+                            : source.is_ext4 ? "mount count " + raw
+                                             : "not ext4, legacy raw count " + raw;
+  if (!addons.names.empty()) {
+    return {true, "addon.d has " + JoinNames(addons.names) + "; " + count};
   }
-  // LineageOS runs backuptool whenever the raw value at 0x34 is non-zero,
-  // without checking the magic. Keep that rule and only label it.
-  bool run = source.mount_count > 0;
-  std::string count = std::to_string(source.mount_count);
-  if (!source.is_ext4) {
-    return {run, "not ext4, legacy raw count " + count};
+  if (source.read_ok && !source.is_ext4) {
+    // Never carries the backuptool script, so running it only exits 127.
+    return {false, count};
   }
-  return {run, "mount count " + count};
+  // The LineageOS rule: run when the source was ever mounted read-write.
+  const bool run = source.read_ok && source.mount_count > 0;
+  return {run, count + AddonSuffix(addons)};
 }
 
 std::string SlotSuffix(unsigned int slot) {
@@ -258,7 +317,8 @@ std::string FormatDecisionLine(const std::string& partition,
 
 int RunCapturingOutput(
     const std::string& command,
-    const std::function<void(const std::string&)>& on_line) {
+    const std::function<void(const std::string&)>& on_line,
+    size_t* output_bytes) {
   // Output goes to an anonymous file rather than a pipe, so a background
   // process that inherits stdout cannot keep this call waiting for EOF.
   int out_fd = memfd_create("backuptool_output", MFD_CLOEXEC);
@@ -267,7 +327,10 @@ int RunCapturingOutput(
   }
   pid_t pid = SpawnShell(command, out_fd);
   int status = pid < 0 ? -1 : WaitForExit(pid);
-  EmitLines(out_fd, on_line);
+  size_t bytes = EmitLines(out_fd, on_line);
+  if (output_bytes != nullptr) {
+    *output_bytes = bytes;
+  }
   close(out_fd);
   return status;
 }

@@ -164,11 +164,12 @@ void PostinstallRunnerAction::PerformAction() {
 
 #if defined(__ANDROID__) && !defined(__ANDROID_RECOVERY__) && \
     defined(RUN_BACKUPTOOL)
-// Logs every input of the LineageOS backuptool gate, then applies it
-// unchanged. The decision still comes from a buffered read of the device that
-// GetPartitionDevice() returns for the source slot. The extra reads (O_DIRECT
-// on that device, buffered and O_DIRECT on /dev/block/mapper/<name><suffix>)
-// only feed the log.
+// Logs every input of the backuptool gate, then applies DecideBackuptool().
+// The mount count comes from a buffered read of the device that
+// GetPartitionDevice() returns for the source slot. For system, the gate also
+// lists the running system's addon.d. The extra reads (O_DIRECT on that
+// device, buffered and O_DIRECT on /dev/block/mapper/<name><suffix>) only
+// feed the log.
 bool PostinstallRunnerAction::RunBackuptoolGate(
     const InstallPlan::Partition& partition, const string& mountable_device) {
   BackuptoolGateInputs gate;
@@ -192,7 +193,12 @@ bool PostinstallRunnerAction::RunBackuptoolGate(
             << gate.source.mount_count << " times.";
   LogBackuptoolGateComparisonReads(gate, have_source);
 
-  const BackuptoolDecision decision = DecideBackuptool(have_source, gate.source);
+  AddonScripts addons;
+  if (partition.name == "system") {
+    addons = ListThirdPartyAddonScripts(kSourceAddonDir);
+  }
+  const BackuptoolDecision decision =
+      DecideBackuptool(have_source, gate.source, addons);
   LOG(INFO) << FormatDecisionLine(partition.name, decision);
   if (!decision.run) {
     LOG(INFO) << "Skipping backuptool scripts";
@@ -236,14 +242,20 @@ bool PostinstallRunnerAction::RunBackuptoolScripts(
   }
 
   // Run backuptool script. Waits for the shell like system() did, and also
-  // logs its stdout and stderr.
+  // logs its stdout and stderr. The shell prints a marker first, so a run
+  // that logs no lines and 0 bytes shows that output never reached the
+  // capture file, rather than that the script printed nothing.
   const string& name = partition.name;
+  size_t output_bytes = 0;
   int ret = RunCapturingOutput(
+      "echo backuptool capture start; "
       "/postinstall/system/bin/backuptool_postinstall.sh",
       [&name](const string& line) {
         LOG(INFO) << "backuptool[" << name << "]: " << line;
-      });
-  LOG(INFO) << "BackuptoolGate: partition=" << name << " backuptool_ret=" << ret;
+      },
+      &output_bytes);
+  LOG(INFO) << "BackuptoolGate: partition=" << name << " backuptool_ret=" << ret
+            << " output_bytes=" << output_bytes;
   if (ret == -1 || WEXITSTATUS(ret) != 0) {
     LOG(ERROR) << "Backuptool postinstall step failed. ret=" << ret;
   }
